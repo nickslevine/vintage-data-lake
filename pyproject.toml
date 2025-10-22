@@ -1,0 +1,21 @@
+[project]
+name = "vintage-data-lake"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "blake3>=1.0.8",
+    "duckdb>=1.4.1",
+    "jupyter>=1.1.1",
+    "jupyterlab>=4.4.9",
+    "orjson>=3.11.3",
+    "pandas>=2.3.3",
+    "polars>=1.34.0",
+    "pyarrow>=21.0.0",
+    "tiktoken>=0.12.0",
+    "torch>=2.9.0",
+    "tqdm>=4.67.1",
+    "transformers>=4.57.1",
+    "zstandard>=0.25.0",
+]
