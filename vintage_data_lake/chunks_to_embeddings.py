@@ -3,6 +3,15 @@ from transformers import AutoModel, AutoTokenizer
 import concurrent.futures
 from math import ceil
 
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+from datetime import datetime
+from datetime import timezone
+import numpy as np
+import os
+from tqdm import tqdm
+
 def make_multi_gpu_encoders(
     model_name: str = "intfloat/e5-large-v2",
     device_ids: list[int] | None = None,
@@ -26,7 +35,7 @@ def make_multi_gpu_encoders(
     for dev in device_ids:
         device = f"cuda:{dev}"
         tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-        mdl = AutoModel.from_pretrained(model_name, torch_dtype=torch_dtype).to(device).eval()
+        mdl = AutoModel.from_pretrained(model_name, dtype=torch_dtype).to(device).eval()
 
         def _mean_pool(last_hidden_state, attention_mask):
             mask = attention_mask.unsqueeze(-1).type_as(last_hidden_state)
@@ -66,7 +75,6 @@ def make_multi_gpu_encoders(
         encode_fns.append(make_encode_fn())
 
     return encode_fns
-
 
 def embed_with_replicas(
     texts: list[str],
@@ -139,3 +147,90 @@ def embed_with_replicas(
             continue
         out[idxs] = embs
     return out
+
+
+def write_embeddings_dataset(
+    base_dir: str,
+    model_name: str,
+    chunk_table: pa.Table,
+    write_i: int,
+    embeddings: "torch.Tensor | np.ndarray",
+    run_id: str | None = None,
+):
+    """
+    Write chunk-level embeddings to a Parquet dataset partitioned by
+    model / year / source.
+
+    Args:
+        base_dir: base path, e.g. "/scratch/v13-ia-lake/data"
+        model_name: short model name, e.g. "e5-large-v2"
+        chunk_table: Arrow Table with at least columns
+                     ["chunk_id", "doc_id", "year", "source"]
+        embeddings: torch.Tensor [N, D] or np.ndarray [N, D]
+        run_id: optional unique string for file naming
+    """
+
+    if isinstance(embeddings, torch.Tensor):
+        embs = embeddings.cpu().numpy()
+    else:
+        embs = embeddings
+    N, D = embs.shape
+
+    if run_id is None:
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+
+    # Normalize column alignment
+    cols = ["chunk_id", "doc_id", "year", "source"]
+    meta_tbl = chunk_table.select(cols)
+    assert len(meta_tbl) == N, "Mismatch between chunk rows and embeddings"
+
+    # Build Arrow arrays
+    vec_array = pa.FixedSizeListArray.from_arrays(pa.array(embs.ravel(), pa.float32()), D)
+    model_col = pa.array([model_name] * N, pa.string())
+    created_at = pa.array([datetime.now( timezone.utc)] * N, pa.timestamp("us"))
+
+    out_tbl = meta_tbl.append_column("model", model_col)
+    out_tbl = out_tbl.append_column("vector", vec_array)
+    out_tbl = out_tbl.append_column("dim",  pa.array([D] * N, type=pa.int32()))
+    out_tbl = out_tbl.append_column("created_at", created_at)
+
+    # Write to dataset
+    out_path = os.path.join(base_dir, "parquet", "embeddings", model_name)
+    schema = pa.schema([
+        ("year", pa.int32()),
+        ("source", pa.string())
+    ])
+    ds.write_dataset(
+        data=out_tbl,
+        base_dir=out_path,
+        format="parquet",
+        partitioning=ds.partitioning(schema, flavor="hive"),
+        existing_data_behavior="overwrite_or_ignore",
+        basename_template=f"part-{run_id}-{write_i}-{{i}}.parquet",
+    )
+    return len(out_tbl)
+
+if __name__ == "__main__":
+    print("Making encoders...")
+    encode_fns = make_multi_gpu_encoders()
+    print("Encoders made.")
+    print("Loading table...")
+    chunks = ds.dataset("/scratch/v13-ia-lake/data/parquet/chunks", format="parquet", partitioning="hive")
+    print("Table loaded.")
+
+    scanner = chunks.scanner(batch_size=64000, columns=["chunk_id","doc_id","year","source","text"])
+    total_row_count = scanner.count_rows()
+    write_i = 0
+    pbar = tqdm(desc="Generating embeddings", total=total_row_count)
+    for batch in scanner.to_batches():
+        batch_table = pa.Table.from_batches([batch])
+        embs = embed_with_replicas(batch_table["text"].to_pylist(), encode_fns, batch_size=1024)
+        row_count = write_embeddings_dataset(
+            base_dir="/scratch/v13-ia-lake/data",
+            model_name="e5-large-v2",
+            chunk_table=batch_table,
+            embeddings=embs,
+            write_i=write_i,
+        )
+        pbar.update(row_count)
+        write_i += 1
