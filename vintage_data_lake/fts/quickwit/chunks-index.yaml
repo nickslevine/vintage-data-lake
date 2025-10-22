@@ -1,0 +1,29 @@
+version: 0.8
+index_id: chunks
+doc_mapping:
+  mode: strict
+  field_mappings:
+    # Exact-match IDs (store; no analysis)
+    - name: chunk_id
+      type: text
+      tokenizer: raw
+      stored: true
+
+    - name: doc_id
+      type: text
+      tokenizer: raw
+      stored: true
+
+    - name: year
+      type: i64
+      fast: true
+
+    - name: source
+      type: text
+      tokenizer: raw
+      stored: true
+
+    - name: text
+      type: text
+      tokenizer: default
+      record: position

@@ -1,0 +1,12 @@
+version: 0.8
+
+# Where Quickwit keeps its metadata & indexes
+metastore_uri: file:///scratch/v13-ia-lake/quickwit/metastore
+default_index_root_uri: file:///scratch/v13-ia-lake/quickwit/indexes
+
+# These must be existing local paths (not URIs)
+data_dir: /scratch/v13-ia-lake/quickwit/data
+
+# Optional: network/cluster bits (defaults are fine for single-node)
+listen_address: 127.0.0.1
+cluster_id: quickwit-default-cluster

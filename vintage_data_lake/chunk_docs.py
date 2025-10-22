@@ -1,7 +1,5 @@
 import pyarrow as pa
 import pyarrow.dataset as ds
-import pyarrow.compute as pc
-import pyarrow.parquet as pq
 import io
 
 from datetime import datetime, timezone
