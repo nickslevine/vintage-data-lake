@@ -30,8 +30,7 @@ class SemanticSearch:
         faiss.omp_set_num_threads(n_threads)        
         return index
 
-    def embed_query(self, query: str) -> np.ndarray:
-
+    def prefix_and_tokenize(self, query: str):
         prefixed_query = f"query: {query}"
 
         inputs = self.tokenizer(
@@ -41,19 +40,20 @@ class SemanticSearch:
             max_length=512,
             return_tensors="pt"
         )
-        
-        # Get model outputs
+        return inputs
+
+
+    def embed_query(self, query: str) -> np.ndarray:
+        inputs = self.prefix_and_tokenize(query)
         with torch.no_grad():
             outputs = self.model(**inputs)
         
-        # Mean pooling with attention mask (same as in chunks_to_embeddings.py)
         attention_mask = inputs["attention_mask"]
         mask = attention_mask.unsqueeze(-1).type_as(outputs.last_hidden_state)
         summed = (outputs.last_hidden_state * mask).sum(dim=1)
         counts = mask.sum(dim=1).clamp(min=1e-9)
         pooled = summed / counts
         
-        # L2 normalize (CRITICAL - index embeddings are normalized!)
         normalized = torch.nn.functional.normalize(pooled, p=2, dim=1)
         
         return normalized.detach().cpu().numpy().astype(np.float32)
@@ -66,17 +66,21 @@ class SemanticSearch:
         joined = self.chunks.join(search_results.lazy(), on=["chunk_id", "year", "source"], how="semi").collect(engine="streaming") # type: ignore
         return joined
 
+    def filter_params(self,params, year_min = None, year_max = None) -> faiss.SearchParametersIVF:
+        if year_min is None:
+            year_min = 0
+        if year_max is None:
+            year_max = 10000
+        selected_ids = self.get_filter_ids(year_min, year_max)
+        print(f"Filtering by years: {year_min} to {year_max}. Found {len(selected_ids)} ids.")
+        params.sel = faiss.IDSelectorBatch(selected_ids) # type: ignore
+        return params
+
     def search(self,query, n=10, year_min = None, year_max = None, n_probe = 64, with_text = True) -> pl.DataFrame:
         params = faiss.SearchParametersIVF()
         params.nprobe = n_probe
         if year_min is not None or year_max is not None:
-            if year_min is None:
-                year_min = 0
-            if year_max is None:
-                year_max = 10000
-            selected_ids = self.get_filter_ids(year_min, year_max)
-            print(f"Filtering by years: {year_min} to {year_max}. Found {len(selected_ids)} ids.")
-            params.sel = faiss.IDSelectorBatch(selected_ids) # type: ignore
+            params = self.filter_params(params, year_min, year_max)
         query_embedding = self.embed_query(query)
         distances, labels = self.index.search(query_embedding, n, params=params) # type: ignore
         search_results = pl.DataFrame({"distances": distances.squeeze(), "labels": labels.squeeze()})
