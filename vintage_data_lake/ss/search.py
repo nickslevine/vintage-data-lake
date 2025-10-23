@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 from transformers import AutoTokenizer, AutoModel
 import torch
+import os
 
 
 def load_index(path: pathlib.Path, n_probe: int):
@@ -18,7 +19,6 @@ def load_index(path: pathlib.Path, n_probe: int):
     Returns:
         IVFPQIndex with CPU index
     """
-    import os
     
     index = faiss.read_index(str(path))
     index.nprobe = n_probe
@@ -67,39 +67,34 @@ def embed_query(query: str, model_name: str = "intfloat/e5-large-v2") -> np.ndar
     
     return normalized.detach().cpu().numpy().astype(np.float32)
 
-def search_with_meta(index: faiss.Index, meta_table: pl.LazyFrame, query: str, n_results: int = 10) -> pl.DataFrame:
-    query_embedding = embed_query(query)
-    distances, labels = index.search(query_embedding, n_results) # type: ignore
-    search_results = pl.DataFrame({"distances": distances.squeeze(), "labels": labels.squeeze()})
-    mt_filtered = meta_table.filter(pl.col("faiss_id").is_in(search_results["labels"].to_list())).collect()
-    return search_results.join(mt_filtered, left_on="labels", right_on="faiss_id", how="left")
-
-
-def get_filter_ids(year_min: int, year_max: int) -> np.ndarray:
-    mt = load_meta_table(pathlib.Path("/scratch/v13-ia-lake/faiss/meta_table"))
-    selected_ids = mt.filter(pl.col("year").is_in(range(year_min, year_max + 1))).select("faiss_id").collect(engine="streaming")["faiss_id"].to_numpy().astype(np.int64, copy=False)
+def get_filter_ids(meta_table: pl.LazyFrame, year_min: int, year_max: int) -> np.ndarray:
+    selected_ids = meta_table.filter(pl.col("year").is_in(range(year_min, year_max + 1))).select("faiss_id").collect(engine="streaming")["faiss_id"].to_numpy().astype(np.int64, copy=False)
     return selected_ids
-
-def search_with_filter(index: faiss.Index, query: str, n_results: int = 10, year_min: int = 1400, year_max: int = 1930) -> pl.DataFrame:
-    selected_ids = get_filter_ids(year_min, year_max)
-    params = faiss.SearchParametersIVF()
-    params.nprobe = 64
-    params.sel = faiss.IDSelectorBatch(selected_ids) # type: ignore
-    query_embedding = embed_query(query)
-    distances, labels = index.search(query_embedding, n_results, params=params) # type: ignore
-    search_results = pl.DataFrame({"distances": distances.squeeze(), "labels": labels.squeeze()})
-    meta_table = load_meta_table(pathlib.Path("/scratch/v13-ia-lake/faiss/meta_table"))
-    mt_filtered = meta_table.filter(pl.col("faiss_id").is_in(search_results["labels"].to_list())).collect()
-    return search_results.join(mt_filtered, left_on="labels", right_on="faiss_id", how="left")
-
 
 def add_chunks_to_search_results(search_results: pl.DataFrame) -> pl.DataFrame:
     chunks_df = pl.scan_parquet("/scratch/v13-ia-lake/data/parquet/chunks")
     joined = chunks_df.join(search_results.lazy(), on=["chunk_id", "year", "source"], how="semi").collect(engine="streaming") # type: ignore
     return joined
 
-def search_with_text(idx: faiss.Index, query: str, n_results: int = 10) -> pl.DataFrame:
+
+def search(idx, query, n=10, year_min = None, year_max = None, n_probe = 64, with_text = True) -> pl.DataFrame:
     mt = load_meta_table(pathlib.Path("/scratch/v13-ia-lake/faiss/meta_table"))
-    results = search_with_meta(idx, mt, query, n_results)
-    with_chunks = add_chunks_to_search_results(results)
-    return with_chunks
+    params = faiss.SearchParametersIVF()
+    params.nprobe = n_probe
+    if year_min is not None or year_max is not None:
+        if year_min is None:
+            year_min = 0
+        if year_max is None:
+            year_max = 10000
+        selected_ids = get_filter_ids(mt, year_min, year_max)
+        print(f"Filtering by years: {year_min} to {year_max}. Found {len(selected_ids)} ids.")
+        params.sel = faiss.IDSelectorBatch(selected_ids) # type: ignore
+    query_embedding = embed_query(query)
+    distances, labels = idx.search(query_embedding, n, params=params) # type: ignore
+    search_results = pl.DataFrame({"distances": distances.squeeze(), "labels": labels.squeeze()})
+    meta_table = load_meta_table(pathlib.Path("/scratch/v13-ia-lake/faiss/meta_table"))
+    mt_filtered = meta_table.filter(pl.col("faiss_id").is_in(search_results["labels"].to_list())).collect()
+    joined = search_results.join(mt_filtered, left_on="labels", right_on="faiss_id", how="left")
+    if with_text:
+        joined = add_chunks_to_search_results(joined)
+    return joined
