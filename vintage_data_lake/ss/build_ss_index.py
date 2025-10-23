@@ -62,13 +62,6 @@ def build_meta_table(ids: np.ndarray, tbl: pa.Table) -> pa.Table:
     )
     return meta_tbl
 
-def cpu_to_gpu_index(index: faiss.Index) -> faiss.Index:
-    res = faiss.StandardGpuResources()
-    co = faiss.GpuClonerOptions()
-    co.useFloat16 = False  
-    co.indicesOptions = faiss.INDICES_64_BIT
-    return faiss.index_cpu_to_gpu(res, 0, index, co)
-
 def run(config: IVFPQConfig, output_folder: pathlib.Path):
     # Set FAISS to use all available CPU cores
     n_threads = os.cpu_count() or 1

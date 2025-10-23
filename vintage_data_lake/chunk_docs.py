@@ -1,16 +1,28 @@
 import pyarrow as pa
 import pyarrow.dataset as ds
-import io
-
 from datetime import datetime, timezone
 import zstandard as zstd
 import blake3
 import re
 import os
-import tiktoken
 from dataclasses import dataclass
+from transformers import AutoTokenizer
+from tqdm import tqdm
+import multiprocessing as mp
+from functools import partial
+import threading
+from queue import Queue
 
 BLOB_URI_RE = re.compile(r"^blob://blake3/([0-9a-f]{2})/([0-9a-f]{2})/([0-9a-f]{64})\\.txt\\.zst$")
+
+_worker_tokenizer = None
+_worker_decompressor = None
+
+def _init_worker() -> None:
+    """Initialize worker process with tokenizer and decompressor."""
+    global _worker_tokenizer, _worker_decompressor
+    _worker_tokenizer = Tokenizer()
+    _worker_decompressor = zstd.ZstdDecompressor()
 
 @dataclass
 class Paths:
@@ -32,13 +44,13 @@ class Paths:
 
 class Tokenizer:
     def __init__(self):
-        self.enc = tiktoken.get_encoding("cl100k_base")
+        self.tk = AutoTokenizer.from_pretrained("intfloat/e5-large-v2", use_fast=True)
 
     def encode(self, text: str) -> list[int]:
-        return self.enc.encode(text)
+        return self.tk.encode(text)
 
     def decode(self, toks: list[int]) -> str:
-        return self.enc.decode(toks)
+        return self.tk.decode(toks, skip_special_tokens=True, clean_up_tokenization_spaces=True)
 
 def now_ts() -> datetime:
     return datetime.now(timezone.utc)
@@ -57,32 +69,22 @@ def blob_path_from_uri(base_blobs: str, uri: str) -> str:
     return os.path.join(base_blobs, "blake3", aa, bb, f"{digest}.txt.zst")
 
 
-def read_blob(uri: str, base_blobs: str) -> str:
+def read_blob(uri: str, base_blobs: str, dctx: zstd.ZstdDecompressor | None = None) -> str:
+    """Read and decompress a blob. Reuses decompressor if provided for efficiency."""
     p = os.path.join(base_blobs, uri[7:])
-    dctx = zstd.ZstdDecompressor()
-
+    if dctx is None:
+        dctx = zstd.ZstdDecompressor()
+    
+    # Read entire file at once for better I/O performance
     with open(p, "rb") as f:
-        with dctx.stream_reader(f) as r:
-            with io.TextIOWrapper(r, encoding="utf-8") as s:
-                return s.read()
+        compressed_data = f.read()
+    
+    # Use streaming reader to handle files without content size in header
+    decompressed = dctx.stream_reader(compressed_data).read()
+    return decompressed.decode("utf-8")
 
 
-# Soft sentence boundaries to avoid chopping mid-sentence (optional)
-SENT_SPLIT = re.compile(r"(?<=[.!?])(\s+|\n+)\n?")
-
-
-def sentence_spans(text: str) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
-    start = 0
-    for m in SENT_SPLIT.finditer(text):
-        end = m.end()
-        spans.append((start, end))
-        start = end
-    if start < len(text):
-        spans.append((start, len(text)))
-    return spans
-
-def merge_spans_to_token_windows(tokens, window: int, overlap: int):
+def merge_spans_to_token_windows(tokens: list[int], window: int, overlap: int) -> list[tuple[int, int]]:
 
     n = len(tokens)
     if n == 0:
@@ -106,7 +108,7 @@ def merge_spans_to_token_windows(tokens, window: int, overlap: int):
 
 
 
-def make_chunk_rows(doc_row, text: str, tk: Tokenizer, window: int, overlap: int) -> list[dict]:
+def make_chunk_rows(doc_row: dict, text: str, tk: Tokenizer, window: int, overlap: int) -> list[dict]:
     doc_id = doc_row["doc_id"]
     year = int(doc_row["year"]) if doc_row["year"] is not None else None
     source = doc_row["source"] or ""
@@ -137,6 +139,15 @@ def make_chunk_rows(doc_row, text: str, tk: Tokenizer, window: int, overlap: int
     return rows
 
 
+def _process_row(row: dict, base_blobs: str, window: int, overlap: int) -> list[dict]:
+    """Process a single document row: read blob, tokenize, create chunks."""
+    assert _worker_tokenizer is not None
+    assert _worker_decompressor is not None
+    text = read_blob(row["text_uri"], base_blobs, _worker_decompressor)
+    rows = make_chunk_rows(row, text, _worker_tokenizer, window, overlap)
+    return rows
+
+
 def rows_to_table(rows: list[dict]) -> pa.Table:
     arrays = {
         "chunk_id": pa.array([r["chunk_id"] for r in rows], pa.string()),
@@ -157,6 +168,7 @@ def rows_to_table(rows: list[dict]) -> pa.Table:
 
 
 def write_chunks(paths: Paths, table: pa.Table, run_id: str, write_i: int) -> None:
+    """Write chunks table to partitioned parquet dataset."""
     basename_template = f"part-{run_id}-{write_i}-{{i}}.parquet"
 
     schema = pa.schema([
@@ -168,16 +180,59 @@ def write_chunks(paths: Paths, table: pa.Table, run_id: str, write_i: int) -> No
         base_dir=paths.chunks,
         format="parquet",
         partitioning=ds.partitioning(schema, flavor="hive"),
-        existing_data_behavior="error",  # safe because basenames are unique per run
+        existing_data_behavior="overwrite_or_ignore",  # safe because basenames are unique per run
         basename_template=basename_template,
     )
 
 
+class AsyncWriter:
+    """Asynchronous writer to avoid blocking processing on I/O."""
+    
+    def __init__(self, paths: Paths, run_id: str):
+        self.paths = paths
+        self.run_id = run_id
+        self.queue: Queue = Queue(maxsize=3)
+        self.write_i = 0
+        self.thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self.thread.start()
+    
+    def _writer_loop(self):
+        """Background thread that writes tables to disk."""
+        while True:
+            item = self.queue.get()
+            if item is None:  # Sentinel to stop
+                break
+            table, write_i = item
+            write_chunks(self.paths, table, self.run_id, write_i)
+            self.queue.task_done()
+    
+    def write(self, table: pa.Table) -> int:
+        """Queue a table for writing. Returns the write index."""
+        write_i = self.write_i
+        self.write_i += 1
+        self.queue.put((table, write_i))
+        return write_i
+    
+    def close(self):
+        """Wait for all pending writes to complete."""
+        self.queue.join()
+        self.queue.put(None)  # Sentinel
+        self.thread.join(timeout=30)
 
-def run(base: str, window: int = 512, overlap: int = 64) -> None:
+
+
+def run(base: str, window: int = 512, overlap: int = 64, prefetch_batches: int = 200) -> None:
+    """
+    Chunk documents into overlapping token windows with streaming pipeline.
+    
+    Args:
+        base: Base directory path containing documents and blobs
+        window: Token window size for chunks
+        overlap: Token overlap between chunks
+        prefetch_batches: Number of document batches to keep in flight (should be > num_workers)
+    """
     paths = Paths(base)
     run_id = datetime.now().strftime("%Y%m%d%H%M%S")
-    tk = Tokenizer()
 
     dataset = ds.dataset(paths.documents, format="parquet", partitioning="hive")
     # Select required columns to minimize IO
@@ -185,36 +240,58 @@ def run(base: str, window: int = 512, overlap: int = 64) -> None:
     scan = dataset.scanner(columns=cols)
 
     written = 0
-    batch_rows = 0
     out_rows: list[dict] = []
-    write_i = 0
 
-    for batch in scan.to_batches():
-        batch_table = pa.Table.from_batches([batch])
-        for row in batch_table.to_pylist():
-            # row is dict[str, Any]
-            try:
-                text = read_blob(row["text_uri"], paths.blobs)
-            except FileNotFoundError as e:
-                print(f"File not found for row: {row['doc_id']}, {row['text_uri']}, {e}")
-                continue
-            rows = make_chunk_rows(row, text, tk, window, overlap)
-            out_rows.extend(rows)
-            if len(out_rows) >= 20000:
-                tbl = rows_to_table(out_rows)
-                write_chunks(paths, tbl, run_id, write_i)
-                write_i += 1
-                written += len(out_rows)
-                out_rows.clear()
-                print(f"[flush] total rows written: {written}")
-            batch_rows += 1
+    pbar = tqdm(desc="Chunking documents", unit=" chunks")
 
+    process_fn = partial(_process_row, base_blobs=paths.blobs, window=window, overlap=overlap)
+    
+    # Use all available cores
+    pool = mp.Pool(processes=100, initializer=_init_worker, maxtasksperchild=1000)
+    
+    # Use async writer to avoid blocking on writes
+    writer = AsyncWriter(paths, run_id)
+    
+    # Generator to yield all rows from dataset
+    def row_generator():
+        for batch in scan.to_batches():
+            batch_table = pa.Table.from_batches([batch])
+            for row in batch_table.to_pylist():
+                yield row
+    
+    # Use imap_unordered for streaming pipeline - workers process continuously
+    # chunksize controls how many tasks are sent to each worker at once
+    result_iter = pool.imap_unordered(process_fn, row_generator(), chunksize=prefetch_batches)
+    
+    write_threshold = 50000
+    
+    # Stream results as they complete
+    for chunk_rows in result_iter:
+        pbar.update(len(chunk_rows))
+        out_rows.extend(chunk_rows)
+        
+        # Write asynchronously when we have enough chunks
+        if len(out_rows) >= write_threshold:
+            tbl = rows_to_table(out_rows)
+            writer.write(tbl)
+            written += len(out_rows)
+            out_rows.clear()
+    
+    # Write final batch
     if out_rows:
         tbl = rows_to_table(out_rows)
-        write_chunks(paths, tbl, run_id, write_i)
+        writer.write(tbl)
         written += len(out_rows)
-        print(f"[flush] total rows written: {written}")
         out_rows.clear()
+    
+    pool.close()
+    pool.join()
+    
+    # Wait for all writes to complete
+    writer.close()
+    
+    pbar.close()
+    print(f"[complete] total chunks written: {written}")
 
 if __name__ == "__main__":
     run("/scratch/v13-ia-lake/data/")

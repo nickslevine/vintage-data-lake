@@ -96,7 +96,7 @@ def ingest_jsonl(jsonl_path: str, batch_size: int = 10000):
     metadata = metadata.set_index("ia_id")
     write_i = 0
     with open(jsonl_path, "rb") as f:
-        for line in tqdm(f):
+        for line in tqdm(f, desc=f"Ingesting {jsonl_path}"):
             if not line.strip():
                 continue
             rec = orjson.loads(line)
@@ -126,3 +126,5 @@ def ingest_jsonl(jsonl_path: str, batch_size: int = 10000):
 
 if __name__ == "__main__":
     ingest_jsonl("/data/ia-data/ocr_fixed_reconstructed.jsonl")
+    ingest_jsonl("/data/ia-data/ocr-v13-2025-10-13-h1_reconstructed.jsonl")
+    ingest_jsonl("/data/ia-data/ocr-v13-2025-10-14-h2_reconstructed.jsonl")

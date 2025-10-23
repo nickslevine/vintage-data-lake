@@ -1,12 +1,10 @@
 import faiss
-import pathlib
 import polars as pl
 from dataclasses import dataclass
 import numpy as np
 from transformers import AutoTokenizer, AutoModel
 import torch
 import os
-from dataclasses import dataclass
 
 @dataclass
 class SemanticSearchConfig:
