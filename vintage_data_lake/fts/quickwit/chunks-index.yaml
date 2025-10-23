@@ -13,6 +13,7 @@ doc_mapping:
       type: text
       tokenizer: raw
       stored: true
+      fast: true
 
     - name: year
       type: i64
@@ -22,8 +23,11 @@ doc_mapping:
       type: text
       tokenizer: raw
       stored: true
+      fast: true
 
     - name: text
       type: text
       tokenizer: default
       record: position
+      fieldnorms: true
+      stored: true # TODO: flip to false; pull from data lake. 
