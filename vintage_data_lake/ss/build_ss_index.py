@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 import pathlib
-from vintage_data_lake.utils import get_embeddings_ds
 import random
 import pyarrow.dataset as ds
 import pyarrow as pa
@@ -21,6 +20,9 @@ class IVFPQConfig:
     vector_dim: int = 1024
 
 
+def get_embeddings_ds():
+    return ds.dataset("/scratch/v13-ia-lake/data/parquet/embeddings/e5-large-v2", format="parquet", partitioning="hive")
+
 def subsample_dataset_by_fragment(dataset: ds.Dataset, fraction: float = 0.1) -> pa.Table:
     random.seed(42)
     fragments = list(dataset.get_fragments())
@@ -36,16 +38,16 @@ def table_to_numpy(table: pa.Table, column_name: str = "vector") -> np.ndarray:
     reshaped = values.reshape(len(column_combined), -1)
     return np.ascontiguousarray(reshaped, dtype=np.float32)
 
-def hash64(s: str) -> np.uint64:
+def hash64(s: str) -> np.int64:
     """
     Stable 64-bit ID from chunk_id (or any string).
     """
     h = hashlib.blake2b(s.encode('utf-8'), digest_size=8).digest()
-    return np.frombuffer(h, dtype=np.uint64)[0]
+    return np.frombuffer(h, dtype=np.int64)[0]
 
 def table_ids_from_chunk_ids(table: pa.Table) -> np.ndarray:
     chunk_ids = table["chunk_id"].to_pylist()
-    ids = np.fromiter((hash64(s) for s in chunk_ids), dtype=np.uint64, count=len(chunk_ids))
+    ids = np.fromiter((hash64(s) for s in chunk_ids), dtype=np.int64, count=len(chunk_ids))
     return ids
 
 def build_meta_table(ids: np.ndarray, tbl: pa.Table) -> pa.Table:
@@ -72,7 +74,7 @@ def run(config: IVFPQConfig, output_folder: pathlib.Path):
     # cols = ["chunk_id", "doc_id", "vector", "year", "source"]
     print("Subsampling dataset...")
     # Increase training data from 1% to 10% for better CPU/memory utilization
-    training_data = subsample_dataset_by_fragment(embeddings_ds, 0.05)
+    training_data = subsample_dataset_by_fragment(embeddings_ds, 0.01)
     print("Converting table to numpy...")
     X = table_to_numpy(training_data, "vector")
     print("Numpy array shape: %s" % (X.shape,))
@@ -126,6 +128,8 @@ def run(config: IVFPQConfig, output_folder: pathlib.Path):
 
 if __name__ == "__main__":
     # Increase batch_size for better throughput and memory utilization
-    config = IVFPQConfig(n_lists=2048, m=16, n_bits=8, batch_size=500000)
+    # config = IVFPQConfig(n_lists=2048, m=16, n_bits=8, batch_size=500000)
+    config = IVFPQConfig(n_lists=8192, m=64, n_bits=8, batch_size=500000)
+
     path = pathlib.Path("/scratch/v13-ia-lake/faiss")
     run(config, path)

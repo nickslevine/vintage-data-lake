@@ -30,4 +30,4 @@ doc_mapping:
       tokenizer: default
       record: position
       fieldnorms: true
-      stored: true # TODO: flip to false; pull from data lake. 
+      stored: false

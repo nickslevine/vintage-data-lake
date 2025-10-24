@@ -17,6 +17,7 @@ def rows_from_table(tbl: pa.Table) -> Dict[str, list]:
             raise ValueError(f"Missing required column `{c}` in batch: {tbl.column_names}")
         cols[c] = tbl[c].to_pylist()
     return cols
+    
 
 def ndjson_iter(tbl: pa.Table) -> Iterable[str]:
     cols = rows_from_table(tbl)
@@ -32,8 +33,6 @@ def ndjson_iter(tbl: pa.Table) -> Iterable[str]:
         }
 
         yield json.dumps(doc, ensure_ascii=False) + "\n"
-
-
 
 
 def post_ndjson(lines: Iterable[str],

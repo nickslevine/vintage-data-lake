@@ -67,3 +67,7 @@ class Lake:
             assert merged[-self.config.overlap:] == stripped[:self.config.overlap]
             merged += stripped[self.config.overlap:]
         return self.tokenizer.decode(merged)
+
+    def get_documents_by_date_range(self, year_min: int, year_max: int) -> pl.DataFrame:
+        cols = ['doc_id', 'title', 'author', 'text_uri', 'preview', 'year', 'source']
+        return self.documents.select(cols).filter((pl.col("year")<=year_max) & (pl.col("year")>=year_min)).collect(engine="streaming")
