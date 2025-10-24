@@ -9,7 +9,7 @@ class LakeConfig:
     path_documents: str = "/scratch/v13-ia-lake/data/parquet/documents"
     path_chunks: str = "/scratch/v13-ia-lake/data/parquet/chunks"
     path_blobs: str = "/scratch/v13-ia-lake/data/blobs"
-    path_embeddings: str = "/scratch/v13-ia-lake/data/parquet/embeddings"
+    path_embeddings: str = "/scratch/v13-ia-lake/data/parquet/embeddings/e5-large-v2"
     overlap: int = 64
     tokenizer_model_name: str = "intfloat/e5-large-v2"
 
@@ -40,6 +40,12 @@ class Lake:
 
     def get_chunk_from_chunk_id(self, chunk_id: str, select_columns = ["doc_id", "chunk_id", "seq", "text", "year", "source"]) -> pl.DataFrame:
         return self.chunks.select(select_columns).filter(pl.col("chunk_id") == chunk_id).collect(engine="streaming")
+
+    def get_chunks_from_chunk_ids(self, chunk_ids: list[str], select_columns = ["doc_id", "chunk_id", "seq", "text", "year", "source"]) -> pl.DataFrame:
+        return self.chunks.select(select_columns).filter(pl.col("chunk_id").is_in(chunk_ids)).collect(engine="streaming")
+
+    def get_embeddings_from_chunk_ids(self, chunk_ids: list[str], select_columns = ["chunk_id", "year", "vector"]) -> pl.DataFrame:
+        return self.embeddings.select(select_columns).filter(pl.col("chunk_id").is_in(chunk_ids)).collect(engine="streaming")
 
     def get_chunk_context(self, chunk_id: str, chunks_before: int = 1, chunks_after: int = 1):
         chunk = self.get_chunk_from_chunk_id(chunk_id, select_columns = ["seq", "doc_id", "chunk_id"])

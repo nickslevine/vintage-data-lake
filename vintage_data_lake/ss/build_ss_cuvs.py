@@ -75,16 +75,18 @@ if __name__ == "__main__":
     print("Train device shape:", train_device.shape)
 
     # Build index parameters
-    build_params = ivf_flat.IndexParams(
+    build_params = ivf_pq.IndexParams(
         metric="sqeuclidean",
         n_lists=65536,
+        pq_dim=64,
+        pq_bits=8,
         kmeans_trainset_fraction=1.0, 
         add_data_on_build=False  
     )
 
     print("Building index...")
     t0 = time.time()
-    index = ivf_flat.build(build_params, train_device)
+    index = ivf_pq.build(build_params, train_device)
     cp.cuda.Stream.null.synchronize()
     print("Index built in %.2f seconds" % (time.time() - t0))
 
@@ -102,14 +104,14 @@ if __name__ == "__main__":
         ids = table_ids_from_chunk_ids(batch_table).astype(np.int64, copy=False)  
         ids_device = cp.asarray(ids, dtype=np.int64)
         batch_device = cp.asarray(X, dtype=cp.float32)
-        index = ivf_flat.extend(index, batch_device, ids_device)
+        index = ivf_pq.extend(index, batch_device, ids_device)
         cp.cuda.Stream.null.synchronize()
         meta_tables.append(build_meta_table(ids, batch_table))
         pbar.update(len(ids))
     pbar.close()
 
     print("Saving index...")
-    ivf_flat.save(index, "/scratch/v13-ia-lake/cuvs/ivf_flat.bin")
+    ivf_pq.save("/scratch/v13-ia-lake/cuvs/ivf_pq.bin", index)
     meta_table: pa.Table = pa.concat_tables(meta_tables)
     print("Writing meta table...")
     ds.write_dataset(

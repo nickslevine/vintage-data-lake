@@ -5,12 +5,15 @@ import numpy as np
 from transformers import AutoTokenizer, AutoModel
 import torch
 import os
-
+from cuvs.neighbors import ivf_pq
+import cupy as cp
 @dataclass
 class SemanticSearchConfig:
     embedding_model_name: str = "intfloat/e5-large-v2"
-    index_path: str = "/scratch/v13-ia-lake/faiss/index.faiss"
-    meta_table_path: str = "/scratch/v13-ia-lake/faiss/meta_table"
+    # index_path: str = "/scratch/v13-ia-lake/faiss/index.faiss"
+    index_path: str = "/scratch/v13-ia-lake/cuvs/ivf_pq.bin"
+    # meta_table_path: str = "/scratch/v13-ia-lake/faiss/meta_table"
+    meta_table_path: str = "/scratch/v13-ia-lake/cuvs/meta_table"
     chunks_path: str = "/scratch/v13-ia-lake/data/parquet/chunks"
 
 class SemanticSearch:
@@ -23,9 +26,11 @@ class SemanticSearch:
         self.chunks = pl.scan_parquet(config.chunks_path)
 
     def load_index(self, path: str):
-        index = faiss.read_index(str(path))
-        n_threads = os.cpu_count() or 1
-        faiss.omp_set_num_threads(n_threads)        
+        # index = faiss.read_index(str(path))
+        # n_threads = os.cpu_count() or 1
+        # faiss.omp_set_num_threads(n_threads)        
+        # return index
+        index = ivf_pq.load(path)
         return index
 
     def prefix_and_tokenize(self, query: str):
@@ -61,29 +66,55 @@ class SemanticSearch:
         return selected_ids
 
     def add_chunks_to_search_results(self, search_results: pl.DataFrame) -> pl.DataFrame:
-        joined = self.chunks.join(search_results.lazy(), on=["chunk_id", "year", "source"], how="semi").collect(engine="streaming") # type: ignore
+        joined = self.chunks.join(search_results.lazy(), on=["chunk_id", "year", "source"], how="inner").collect(engine="streaming") # type: ignore
         return joined
 
-    def filter_params(self,params, year_min = None, year_max = None) -> faiss.SearchParametersIVF:
-        if year_min is None:
-            year_min = 0
-        if year_max is None:
-            year_max = 10000
-        selected_ids = self.get_filter_ids(year_min, year_max)
-        print(f"Filtering by years: {year_min} to {year_max}. Found {len(selected_ids)} ids.")
-        params.sel = faiss.IDSelectorBatch(selected_ids) # type: ignore
-        return params
+    # def filter_params(self,params, year_min = None, year_max = None) -> faiss.SearchParametersIVF:
+    #     if year_min is None:
+    #         year_min = 0
+    #     if year_max is None:
+    #         year_max = 10000
+    #     selected_ids = self.get_filter_ids(year_min, year_max)
+    #     print(f"Filtering by years: {year_min} to {year_max}. Found {len(selected_ids)} ids.")
+    #     params.sel = faiss.IDSelectorBatch(selected_ids) # type: ignore
+    #     return params
 
-    def search(self,query, n=10, year_min = None, year_max = None, n_probe = 64, with_text = True) -> pl.DataFrame:
-        params = faiss.SearchParametersIVF()
-        params.nprobe = n_probe
-        if year_min is not None or year_max is not None:
-            params = self.filter_params(params, year_min, year_max)
+    def search(self,query, n=10, year_min = None, year_max = None, n_probes = 64, with_text = True):
+        search_params = ivf_pq.SearchParams(n_probes = n_probes)
         query_embedding = self.embed_query(query)
-        distances, labels = self.index.search(query_embedding, n, params=params) # type: ignore
-        search_results = pl.DataFrame({"distances": distances.squeeze(), "labels": labels.squeeze()})
+        query_embedding = cp.asarray(query_embedding, dtype=cp.float32)
+        distances, labels = ivf_pq.search(search_params, self.index, query_embedding, n)
+        search_results = pl.DataFrame({"distances": cp.asnumpy(distances).squeeze(), "labels": cp.asnumpy(labels).squeeze()})
         mt_filtered = self.meta_table.filter(pl.col("faiss_id").is_in(search_results["labels"].to_list())).collect()
         joined = search_results.join(mt_filtered, left_on="labels", right_on="faiss_id", how="left")
         if with_text:
             joined = self.add_chunks_to_search_results(joined)
-        return joined
+        return joined.sort("distances")
+
+    def search_array(self,query_array: np.ndarray, n=10, year_min = None, year_max = None, n_probes = 64, with_text = True):
+        search_params = ivf_pq.SearchParams(n_probes = n_probes)
+        query_embedding = cp.asarray(query_array, dtype=cp.float32)
+        distances, labels = ivf_pq.search(search_params, self.index, query_embedding, n)
+        search_results = pl.DataFrame({"distances": cp.asnumpy(distances).squeeze(), "labels": cp.asnumpy(labels).squeeze()})
+        mt_filtered = self.meta_table.filter(pl.col("faiss_id").is_in(search_results["labels"].to_list())).collect()
+        joined = search_results.join(mt_filtered, left_on="labels", right_on="faiss_id", how="left")
+        if with_text:
+            joined = self.add_chunks_to_search_results(joined)
+        return joined.sort("distances")
+
+
+    
+
+
+        # params = faiss.SearchParametersIVF()
+        # params.nprobe = n_probe
+        # if year_min is not None or year_max is not None:
+        #     params = self.filter_params(params, year_min, year_max)
+        # query_embedding = self.embed_query(query)
+        # distances, labels = self.index.search(query_embedding, n, params=params) # type: ignore
+        # search_results = pl.DataFrame({"distances": distances.squeeze(), "labels": labels.squeeze()})
+        # mt_filtered = self.meta_table.filter(pl.col("faiss_id").is_in(search_results["labels"].to_list())).collect()
+        # joined = search_results.join(mt_filtered, left_on="labels", right_on="faiss_id", how="left")
+        # if with_text:
+        #     joined = self.add_chunks_to_search_results(joined)
+        # return joined
